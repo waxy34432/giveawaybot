@@ -9,7 +9,7 @@ DB_PATH = os.environ.get("DB_PATH", "giveaways_v2.db")
 _GIVEAWAY_COLS = (
     "owner_id", "title", "text", "photos", "price", "btn_text", "extra",
     "post_chat_id", "winners_count", "start_at", "end_mode", "end_at",
-    "end_count", "draw_mode", "boost", "captcha", "status", "created_at",
+    "end_count", "draw_mode", "boost", "captcha", "status", "created_at", "pay_mode",
 )
 _UPDATABLE = {"post_message_id", "status", "start_at"}
 
@@ -60,6 +60,18 @@ def init_db():
             PRIMARY KEY(giveaway_id, user_id)
         );
         """)
+    with _conn() as c:
+        # миграции для баз, созданных прошлыми версиями
+        def cols(table):
+            return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if "pay_mode" not in cols("giveaways"):
+            c.execute("ALTER TABLE giveaways ADD COLUMN pay_mode TEXT DEFAULT 'manual'")
+        if "method" not in cols("orders"):
+            c.execute("ALTER TABLE orders ADD COLUMN method TEXT DEFAULT 'manual'")
+        if "charge_id" not in cols("orders"):
+            c.execute("ALTER TABLE orders ADD COLUMN charge_id TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_charge "
+                  "ON orders(charge_id) WHERE charge_id IS NOT NULL")
 
 
 # ---------- настройки ----------
@@ -124,6 +136,7 @@ def _g(row):
 
 def add_giveaway(**kw):
     kw.setdefault("created_at", int(time.time()))
+    kw.setdefault("pay_mode", "manual")
     kw["photos"] = json.dumps(kw.get("photos", []))
     kw["extra"] = json.dumps(kw.get("extra", []))
     values = [kw.get(col) for col in _GIVEAWAY_COLS]
@@ -291,6 +304,20 @@ def add_order(gid, user_id, username, qty, receipt_id, receipt_type):
             (gid, user_id, username, qty, receipt_id, receipt_type),
         )
         return cur.lastrowid
+
+
+def add_paid_order(gid, user_id, username, qty, charge_id, status="approved"):
+    """Заявка по оплате через ЮKassa. Повторный charge_id даёт None (защита от дублей)."""
+    try:
+        with _conn() as c:
+            cur = c.execute(
+                "INSERT INTO orders(giveaway_id, user_id, username, qty, status, method, charge_id) "
+                "VALUES(?,?,?,?,?, 'yookassa', ?)",
+                (gid, user_id, username, qty, status, charge_id),
+            )
+            return cur.lastrowid
+    except sqlite3.IntegrityError:
+        return None
 
 
 def get_order(oid):

@@ -2,6 +2,7 @@ import asyncio
 import csv
 import html
 import io
+import json
 import logging
 import random
 import time
@@ -10,21 +11,24 @@ from collections import defaultdict
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message,
-    ReplyKeyboardMarkup, ReplyParameters,
+    InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, LabeledPrice, Message,
+    PreCheckoutQuery, ReplyKeyboardMarkup, ReplyParameters,
 )
 
 import db
 import logic
 import templates
 from cleanchat import CleanChatMiddleware, CleanUserMessages, send_mode
-from config import ADMIN_IDS, BOT_TOKEN, CLEAN_USER_MESSAGES, SUPPORT_CONTACT
+from config import (
+    ADMIN_IDS, BOT_TOKEN, CLEAN_USER_MESSAGES, SUPPORT_CONTACT, YOOKASSA_PROVIDER_TOKEN,
+    YOOKASSA_RECEIPT, YOOKASSA_TAX_SYSTEM, YOOKASSA_VAT_CODE,
+)
 
 log = logging.getLogger("giveaway")
 
@@ -47,6 +51,10 @@ STATUS_NAME = {
     "finished": "завершён", "cancelled": "отменён", "error": "ошибка публикации",
 }
 
+PAY_MODE_NAME = {
+    "manual": "по реквизитам (чек)", "yookassa": "картой через ЮKassa", "both": "ЮKassa или по реквизитам",
+}
+
 ADMIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Создать розыгрыш"), KeyboardButton(text="🎁 Мои розыгрыши")],
@@ -65,6 +73,7 @@ class Create(StatesGroup):
     text = State()
     photos = State()
     price = State()
+    pay_mode = State()
     btn = State()
     btn_custom = State()
     winners = State()
@@ -78,6 +87,7 @@ class Create(StatesGroup):
     end_count = State()
     draw_mode = State()
     options = State()
+    fix_text = State()
     confirm = State()
 
 
@@ -114,6 +124,17 @@ def btn(text, data):
 
 
 CANCEL = [btn("❌ Отмена", "cancel")]
+HOME = [btn("🏠 Главное меню", "menu")]
+NAV = [btn("⬅️ Назад", "back"), btn("🏠 Меню", "menu")]
+
+
+def back_to(data: str) -> list:
+    """Ряд кнопок: на предыдущий экран и в главное меню."""
+    return [btn("⬅️ Назад", data), btn("🏠 Меню", "menu")]
+
+
+async def show_main_menu(message: Message):
+    await message.answer("🏠 Главное меню. Выберите действие:", reply_markup=ADMIN_KB)
 
 
 async def safe_send(bot: Bot, chat_id, text, **kw):
@@ -229,21 +250,57 @@ def post_text(g: dict) -> str:
     return "\n".join(lines)
 
 
+# Подпись к фото в Telegram ограничена 1024 символами; берём запас на строку о завершении.
+CAPTION_LIMIT = 980
+
+
+def caption_size(g: dict) -> int:
+    """Размер подписи к фото: текст поста плюс место под ссылку/кнопку."""
+    return logic.visible_len(post_text(g)) + len(g["btn_text"]) + 6
+
+
+def caption_fits(g: dict) -> bool:
+    return caption_size(g) <= CAPTION_LIMIT
+
+
+def draft_giveaway(d: dict) -> dict:
+    """Заготовка розыгрыша из данных мастера создания, чтобы заранее посчитать длину поста."""
+    return {
+        "id": 0, "title": d["title"], "text": d["text"], "photos": d.get("photos", []),
+        "price": d["price"], "btn_text": d["btn_text"], "extra": d.get("extra", []),
+        "post_chat_id": d["post_chat"], "winners_count": d["winners"],
+        "end_mode": d["end_mode"], "end_at": d.get("end_at"), "end_count": d.get("end_count"),
+    }
+
+
 async def publish(bot: Bot, g: dict) -> int:
+    """Публикует пост одним сообщением: фото и текст вместе.
+
+    - без фото: текст с кнопкой;
+    - одно фото: фото с подписью и кнопкой;
+    - 2–3 фото: альбом с подписью и ссылкой «участвовать» (под альбомом Telegram не даёт кнопок).
+    """
     me = await bot.get_me()
-    markup = kb([[InlineKeyboardButton(
-        text=g["btn_text"], url=f"https://t.me/{me.username}?start=g_{g['id']}")]])
+    url = f"https://t.me/{me.username}?start=g_{g['id']}"
+    markup = kb([[InlineKeyboardButton(text=g["btn_text"], url=url)]])
     text, photos, chat = post_text(g), g["photos"], g["post_chat_id"]
+    fits = caption_fits(g)
     if not photos:
         msg = await bot.send_message(chat, text, reply_markup=markup)
-    elif len(photos) == 1:
-        if len(text) <= 1000:
-            msg = await bot.send_photo(chat, photos[0], caption=text, reply_markup=markup)
-        else:
-            await bot.send_photo(chat, photos[0])
-            msg = await bot.send_message(chat, text, reply_markup=markup)
+    elif len(photos) == 1 and fits:
+        msg = await bot.send_photo(chat, photos[0], caption=text, reply_markup=markup)
+    elif len(photos) >= 2 and fits:
+        caption = text + f'\n\n👉 <a href="{url}">{esc(g["btn_text"])}</a>'
+        msgs = await bot.send_media_group(chat, [
+            InputMediaPhoto(media=p, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML)
+            for i, p in enumerate(photos)])
+        return msgs[0].message_id
     else:
-        await bot.send_media_group(chat, [InputMediaPhoto(media=p) for p in photos])
+        # запасной вариант для очень длинного текста: подпись не влезает, отправляем раздельно
+        if len(photos) == 1:
+            await bot.send_photo(chat, photos[0])
+        else:
+            await bot.send_media_group(chat, [InputMediaPhoto(media=p) for p in photos])
         msg = await bot.send_message(chat, text, reply_markup=markup)
     return msg.message_id
 
@@ -269,19 +326,29 @@ async def start_giveaway(bot: Bot, gid: int):
 
 
 async def remove_post_button(bot: Bot, g: dict):
-    if g.get("post_message_id"):
-        try:
+    """Убирает возможность участвовать в посте: кнопку или ссылку в подписи альбома."""
+    if not g.get("post_message_id"):
+        return
+    try:
+        if len(g["photos"]) >= 2 and caption_fits(g):
+            await bot.edit_message_caption(
+                chat_id=g["post_chat_id"], message_id=g["post_message_id"],
+                caption=post_text(g) + "\n\n🏁 Приём участников завершён")
+        else:
             await bot.edit_message_reply_markup(
                 chat_id=g["post_chat_id"], message_id=g["post_message_id"], reply_markup=None)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 
-def draw_buttons(gid: int):
-    return kb([
+def draw_buttons(gid: int, back: str = None):
+    rows = [
         [btn("🎲 Рандом", f"gvr:{gid}"), btn("✍️ Вручную", f"gvm:{gid}")],
         [btn("👥 Участники", f"gvp:{gid}")],
-    ])
+    ]
+    if back:
+        rows.append(back_to(back))
+    return kb(rows)
 
 
 async def close_entries(bot: Bot, gid: int):
@@ -457,6 +524,7 @@ async def send_qty(message: Message, g: dict, user_id: int):
     have = db.user_tickets(g["id"], user_id)
     head = f"У вас уже есть билетов: {len(have)}. " if have else ""
     rows = [[btn(f"{q} шт. — {g['price'] * q} ₽", f"qty:{g['id']}:{q}")] for q in QTY_OPTIONS]
+    rows.append([btn("🏠 В начало", "menu")])
     await message.answer(
         head + "Выберите количество билетов. Каждый билет — отдельный слот с уникальным номером:",
         reply_markup=kb(rows),
@@ -500,29 +568,189 @@ async def captcha_answer(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await join_flow(cb.message, state, bot, cb.from_user, gid)
 
 
+def effective_pay_mode(g: dict) -> str:
+    """Способ оплаты с учётом того, подключена ли ЮKassa."""
+    mode = g.get("pay_mode") or "manual"
+    if not YOOKASSA_PROVIDER_TOKEN:
+        return "manual"
+    return mode
+
+
+async def check_can_buy(cb: CallbackQuery, state: FSMContext, bot: Bot, g):
+    """Общие проверки перед оплатой. Возвращает True, если можно продолжать."""
+    if not g or g["status"] != "active":
+        await cb.answer("Розыгрыш завершён", show_alert=True)
+        return False
+    if not await is_subscribed(bot, cb.from_user.id, required_ids(g)):
+        await cb.answer("Подпишитесь на все каналы", show_alert=True)
+        return False
+    if g["captcha"] and not db.captcha_passed(g["id"], cb.from_user.id):
+        await cb.answer()
+        await send_captcha(cb.message, state, g["id"])
+        return False
+    return True
+
+
 @user_router.callback_query(F.data.startswith("qty:"))
 async def choose_qty(cb: CallbackQuery, state: FSMContext, bot: Bot):
     _, gid, qty = cb.data.split(":")
     gid, qty = int(gid), int(qty)
     g = db.get_giveaway(gid)
-    if not g or g["status"] != "active":
-        return await cb.answer("Розыгрыш завершён", show_alert=True)
-    if not await is_subscribed(bot, cb.from_user.id, required_ids(g)):
-        return await cb.answer("Подпишитесь на все каналы", show_alert=True)
-    if g["captcha"] and not db.captcha_passed(gid, cb.from_user.id):
+    if not await check_can_buy(cb, state, bot, g):
+        return
+    mode = effective_pay_mode(g)
+    if mode == "both":
         await cb.answer()
-        return await send_captcha(cb.message, state, gid)
+        return await cb.message.answer(
+            f"К оплате: <b>{g['price'] * qty} ₽</b> ({qty} шт.). Как удобнее оплатить?",
+            reply_markup=kb([
+                [btn("💳 Картой (ЮKassa)", f"pay:y:{gid}:{qty}")],
+                [btn("🧾 По реквизитам (чек)", f"pay:m:{gid}:{qty}")],
+                [btn("⬅️ Назад", f"qb:{gid}"), btn("🏠 В начало", "menu")],
+            ]))
+    await start_payment(cb, state, bot, g, qty, "y" if mode == "yookassa" else "m")
+
+
+@user_router.callback_query(F.data.startswith("pay:"))
+async def choose_pay_method(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    _, method, gid, qty = cb.data.split(":")
+    g = db.get_giveaway(int(gid))
+    if not await check_can_buy(cb, state, bot, g):
+        return
+    await start_payment(cb, state, bot, g, int(qty), method)
+
+
+async def start_payment(cb: CallbackQuery, state: FSMContext, bot: Bot, g: dict, qty: int, method: str):
+    if method == "y":
+        if not YOOKASSA_PROVIDER_TOKEN:
+            return await cb.answer("Оплата картой временно недоступна", show_alert=True)
+        await cb.answer()
+        return await send_yookassa_invoice(cb.message, bot, g, qty)
     details = db.get_setting(f"payment:{g['owner_id']}")
     if not details:
         return await cb.answer("Оплата временно недоступна, попробуйте позже", show_alert=True)
+    await cb.answer()
+    await send_payment_prompt(cb.message, state, g, qty, details)
+
+
+async def send_yookassa_invoice(message: Message, bot: Bot, g: dict, qty: int):
+    """Счёт через платежи Telegram (провайдер ЮKassa). Билеты выдаются после успешной оплаты."""
+    amount = g["price"] * qty
+    kwargs = {}
+    if YOOKASSA_RECEIPT:
+        receipt = logic.build_receipt(
+            f"Билеты в розыгрыше «{g['title']}»", qty, g["price"], YOOKASSA_VAT_CODE, YOOKASSA_TAX_SYSTEM)
+        kwargs.update(need_email=True, send_email_to_provider=True,
+                      provider_data=json.dumps(receipt, ensure_ascii=False))
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title=f"Билеты: {g['title']}"[:32],
+        description=f"{qty} шт. в розыгрыше «{g['title']}». Каждый билет — отдельный слот.",
+        payload=f"gv:{g['id']}:{qty}",
+        provider_token=YOOKASSA_PROVIDER_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice(label=f"Билеты, {qty} шт.", amount=amount * 100)],
+        reply_markup=kb([
+            [InlineKeyboardButton(text=f"Оплатить {amount} ₽", pay=True)],
+            [btn("⬅️ Назад", f"qb:{g['id']}"), btn("🏠 В начало", "menu")],
+        ]),
+        **kwargs,
+    )
+
+
+@user_router.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    """Telegram спрашивает, можно ли принять платёж (нужно ответить за 10 секунд)."""
+    parsed = logic.parse_invoice_payload(q.invoice_payload)
+    g = db.get_giveaway(parsed[0]) if parsed else None
+    if not g or g["status"] != "active":
+        return await q.answer(ok=False, error_message="Приём участников в этом розыгрыше уже закрыт.")
+    qty = parsed[1]
+    if q.currency != "RUB" or q.total_amount != g["price"] * qty * 100:
+        return await q.answer(ok=False, error_message="Сумма платежа не совпадает с заказом. Начните оплату заново.")
+    await q.answer(ok=True)
+
+
+@user_router.message(F.successful_payment)
+async def on_successful_payment(m: Message, bot: Bot):
+    sp = m.successful_payment
+    parsed = logic.parse_invoice_payload(sp.invoice_payload)
+    if not parsed:
+        return
+    gid, qty = parsed
+    g = db.get_giveaway(gid)
+    user = m.from_user
+    charge = sp.provider_payment_charge_id or sp.telegram_payment_charge_id
+    username = user.username or str(user.id)
+    if not g:
+        return
+    active = g["status"] == "active"
+    oid = db.add_paid_order(gid, user.id, username, qty, charge, "approved" if active else "paid_late")
+    if oid is None:  # этот платёж уже обработан
+        return
+    db.upsert_participant(gid, user.id, user.username, user.full_name)
+    amount = sp.total_amount // 100
+    owner_line = (f"@{esc(username)} (ID {user.id}), билетов: {qty}, сумма: {amount} ₽, "
+                  f"розыгрыш «{esc(g['title'])}»")
+    if active:
+        numbers = db.issue_tickets(gid, user.id, qty)
+        with send_mode("final"):
+            await m.answer(
+                f"✅ Оплата получена! Ваши номера билетов в розыгрыше «{esc(g['title'])}»: "
+                + ", ".join(f"<code>{n}</code>" for n in numbers)
+                + "\nЧем больше билетов — тем больше шансов!")
+        await safe_send(bot, g["owner_id"], f"💳 Оплата через ЮKassa: {owner_line}.")
+        await maybe_close_by_count(bot, gid)
+    else:
+        with send_mode("final"):
+            await m.answer(
+                "⚠️ Платёж получен, но приём участников в этом розыгрыше уже закрыт. "
+                "Организатор свяжется с вами по возврату.")
+        await safe_send(
+            bot, g["owner_id"],
+            f"⚠️ Платёж через ЮKassa пришёл после закрытия приёма: {owner_line}. "
+            f"Билеты не выданы, верните деньги в личном кабинете ЮKassa. ID платежа: {esc(str(charge))}")
+
+
+async def send_payment_prompt(message: Message, state: FSMContext, g: dict, qty: int, details: str):
     await state.set_state(Buy.receipt)
-    await state.update_data(gid=gid, qty=qty)
-    await cb.message.answer(
+    await state.update_data(gid=g["id"], qty=qty, receipt_id=None, receipt_type=None)
+    await message.answer(
         f"К оплате: <b>{g['price'] * qty} ₽</b> ({qty} шт.)\n\n"
         f"Реквизиты:\n{esc(details)}\n\n"
-        "После оплаты пришлите фото или PDF чека."
+        "После оплаты пришлите фото или PDF чека.",
+        reply_markup=kb([[btn("⬅️ Назад", f"qb:{g['id']}"), btn("🏠 В начало", "menu")]]),
     )
+
+
+@user_router.callback_query(F.data.startswith("qb:"))
+async def qty_back(cb: CallbackQuery, state: FSMContext):
+    g = db.get_giveaway(int(cb.data.split(":")[1]))
+    await state.clear()
     await cb.answer()
+    if not g or g["status"] != "active":
+        return await cb.message.answer("Розыгрыш не найден или уже завершён.")
+    await send_qty(cb.message, g, cb.from_user.id)
+
+
+@user_router.callback_query(F.data == "pb", Buy.receipt)
+async def pay_back(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    g = db.get_giveaway(d.get("gid"))
+    details = db.get_setting(f"payment:{g['owner_id']}") if g else None
+    await cb.answer()
+    if not g or g["status"] != "active" or not details:
+        await state.clear()
+        return await cb.message.answer("Розыгрыш не найден или уже завершён.")
+    await send_payment_prompt(cb.message, state, g, d["qty"], details)
+
+
+@user_router.callback_query(F.data == "menu")
+async def user_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await cb.message.answer(
+        "👋 Чтобы принять участие в розыгрыше, нажмите кнопку под постом розыгрыша в канале.")
 
 
 @user_router.message(Buy.receipt, F.photo | F.document)
@@ -534,7 +762,8 @@ async def got_receipt(m: Message, state: FSMContext):
     await state.update_data(receipt_id=rid, receipt_type=rtype)
     await m.answer(
         "Чек получен. Нажмите кнопку, чтобы отправить заявку организатору:",
-        reply_markup=kb([[btn("✅ Я оплатил", "paid")]]),
+        reply_markup=kb([[btn("✅ Я оплатил", "paid")],
+                         [btn("⬅️ Назад", "pb"), btn("🏠 В начало", "menu")]]),
     )
 
 
@@ -546,7 +775,7 @@ async def receipt_hint(m: Message):
 @user_router.callback_query(F.data == "paid", Buy.receipt)
 async def paid(cb: CallbackQuery, state: FSMContext, bot: Bot):
     d = await state.get_data()
-    if "receipt_id" not in d:
+    if not d.get("receipt_id"):
         return await cb.answer("Сначала пришлите чек", show_alert=True)
     g = db.get_giveaway(d["gid"])
     if not g or g["status"] != "active":
@@ -620,6 +849,13 @@ async def admin_cancel_cb(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Отменено.", reply_markup=ADMIN_KB)
 
 
+@admin_router.callback_query(F.data == "menu")
+async def admin_menu_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await show_main_menu(cb.message)
+
+
 @admin_router.message(F.text == "🛟 Поддержка")
 async def support(m: Message, state: FSMContext):
     await state.clear()
@@ -638,24 +874,24 @@ async def support(m: Message, state: FSMContext):
     )
     if SUPPORT_CONTACT:
         text += f"\nКонтакт: {esc(SUPPORT_CONTACT)}"
-    await m.answer(text, reply_markup=ADMIN_KB)
+    await m.answer(text, reply_markup=kb([HOME]))
 
 
 @admin_router.message(F.text == "💳 Реквизиты")
 async def req_start(m: Message, state: FSMContext):
     await state.clear()
     current = db.get_setting(f"payment:{m.from_user.id}", "не заданы")
+    yk = ("✅ ЮKassa подключена" if YOOKASSA_PROVIDER_TOKEN
+          else "ℹ️ ЮKassa не подключена (задайте YOOKASSA_PROVIDER_TOKEN на хостинге)")
     await state.set_state(Requisites.text)
     await m.answer(
-        f"Текущие реквизиты:\n{esc(current)}\n\n"
-        "Пришлите новый текст реквизитов. Они показываются участникам платных розыгрышей. "
-        "Для отмены: /cancel")
+        f"{yk}\n\nТекущие реквизиты:\n{esc(current)}\n\n"
+        "Пришлите новый текст реквизитов. Они показываются участникам платных розыгрышей.",
+        reply_markup=kb([HOME]))
 
 
-@admin_router.message(F.text == "📢 Мои каналы")
-async def my_channels(m: Message, state: FSMContext):
-    await state.clear()
-    chans = db.list_channels(m.from_user.id)
+async def show_channels(message: Message, uid: int, note: str = ""):
+    chans = db.list_channels(uid)
     if chans:
         text = "📢 <b>Ваши каналы</b>, где бот администратор:\n\n" + "\n".join(
             f"• {esc(c['title'])}" + (f" (@{esc(c['username'])})" if c["username"] else "") for c in chans)
@@ -665,7 +901,21 @@ async def my_channels(m: Message, state: FSMContext):
              "и выдайте права администратора. Либо подключите по @username кнопкой ниже.")
     rows = [[btn(f"🗑 Убрать «{c['title']}»", f"chdel:{c['chat_id']}")] for c in chans]
     rows.append([btn("➕ Добавить по @username", "chadd")])
-    await m.answer(text, reply_markup=kb(rows))
+    rows.append(HOME)
+    await message.answer(note + text, reply_markup=kb(rows))
+
+
+@admin_router.message(F.text == "📢 Мои каналы")
+async def my_channels(m: Message, state: FSMContext):
+    await state.clear()
+    await show_channels(m, m.from_user.id)
+
+
+@admin_router.callback_query(F.data == "chl")
+async def channels_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await show_channels(cb.message, cb.from_user.id)
 
 
 @admin_router.message(F.text == "➕ Создать розыгрыш")
@@ -674,26 +924,32 @@ async def create_start(m: Message, state: FSMContext):
     if not db.list_channels(m.from_user.id):
         return await m.answer(
             "Сначала подключите канал: добавьте бота администратором в канал "
-            "или используйте «📢 Мои каналы» → «Добавить по @username».")
-    await state.set_state(Create.template)
-    rows = [[btn(t["name"], f"tp:{key}")] for key, t in templates.TEMPLATES.items()]
-    rows.append([btn("✍️ Свой текст", "tp:custom")])
-    rows.append(CANCEL)
-    await m.answer(
-        "🧩 Выберите шаблон розыгрыша: бот сам оформит текст, вам останется назвать приз. "
-        "Или напишите свой текст, бот его отформатирует.",
-        reply_markup=kb(rows))
+            "или используйте «📢 Мои каналы» → «Добавить по @username».",
+            reply_markup=kb([[btn("📢 Мои каналы", "chl")], HOME]))
+    await ask_template(m, state, m.from_user.id)
+
+
+async def show_giveaways(message: Message, uid: int):
+    gs = db.list_giveaways(uid)
+    if not gs:
+        return await message.answer("У вас пока нет розыгрышей.", reply_markup=kb([HOME]))
+    rows = [[btn(f"{STATUS_ICON.get(g['status'], '•')} #{g['id']} {g['title']}", f"gv:{g['id']}")]
+            for g in gs]
+    rows.append(HOME)
+    await message.answer("🎁 <b>Ваши розыгрыши</b>:", reply_markup=kb(rows))
 
 
 @admin_router.message(F.text == "🎁 Мои розыгрыши")
 async def my_giveaways(m: Message, state: FSMContext):
     await state.clear()
-    gs = db.list_giveaways(m.from_user.id)
-    if not gs:
-        return await m.answer("У вас пока нет розыгрышей.")
-    rows = [[btn(f"{STATUS_ICON.get(g['status'], '•')} #{g['id']} {g['title']}", f"gv:{g['id']}")]
-            for g in gs]
-    await m.answer("🎁 <b>Ваши розыгрыши</b>:", reply_markup=kb(rows))
+    await show_giveaways(m, m.from_user.id)
+
+
+@admin_router.callback_query(F.data == "gl")
+async def giveaways_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await show_giveaways(cb.message, cb.from_user.id)
 
 
 @admin_router.message(Requisites.text, F.text)
@@ -707,17 +963,20 @@ async def req_save(m: Message, state: FSMContext):
 async def channel_delete(cb: CallbackQuery):
     chat_id = int(cb.data.split(":", 1)[1])
     row = db.get_channel(chat_id)
+    await cb.answer()
+    note = ""
     if row and row["added_by"] == cb.from_user.id:
         db.remove_channel(chat_id)
-        await cb.message.answer(f"Канал «{esc(row['title'])}» убран из списка.")
-    await cb.answer()
+        note = f"Канал «{esc(row['title'])}» убран из списка.\n\n"
+    await show_channels(cb.message, cb.from_user.id, note)
 
 
 @admin_router.callback_query(F.data == "chadd")
 async def channel_add_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddChannel.username)
     await cb.message.answer(
-        "Пришлите @username канала. Бот должен быть в нём администратором. Для отмены: /cancel")
+        "Пришлите @username канала. Бот должен быть в нём администратором.",
+        reply_markup=kb([back_to("chl")]))
     await cb.answer()
 
 
@@ -727,187 +986,127 @@ async def channel_add_save(m: Message, state: FSMContext, bot: Bot):
     if error:
         return await m.answer(error)
     await state.clear()
-    await m.answer(f"✅ Канал «{esc(chat.title or str(chat.id))}» подключён.", reply_markup=ADMIN_KB)
+    await show_channels(m, m.from_user.id, f"✅ Канал «{esc(chat.title or str(chat.id))}» подключён.\n\n")
 
 
 # ======================================================================
 # Создание розыгрыша
 # ======================================================================
 
-@admin_router.message(Create.title, F.text)
-async def c_title(m: Message, state: FSMContext):
-    await state.update_data(title=m.text.strip()[:100])
-    await state.set_state(Create.text)
-    await m.answer(
-        "✍️ Текст розыгрыша: что разыгрываем и условия. Форматирование сохранится.",
-        reply_markup=kb([CANCEL]))
-
-
-@admin_router.callback_query(Create.template, F.data.startswith("tp:"))
-async def c_template(cb: CallbackQuery, state: FSMContext):
-    key = cb.data.split(":", 1)[1]
-    await cb.answer()
-    if key == "custom":
-        await state.update_data(tpl=None)
-        await state.set_state(Create.title)
-        return await cb.message.answer(
-            "📝 Название розыгрыша (для вашего списка и заголовка поста):",
-            reply_markup=kb([CANCEL]))
-    if key not in templates.TEMPLATES:
-        return
-    await state.update_data(tpl=key)
-    await state.set_state(Create.prize)
-    await cb.message.answer(templates.TEMPLATES[key]["ask"], reply_markup=kb([CANCEL]))
-
-
-@admin_router.message(Create.prize, F.text)
-async def c_prize(m: Message, state: FSMContext):
+async def enter(state: FSMContext, step: str, st):
+    """Запоминает шаг в стеке навигации и включает его состояние."""
     d = await state.get_data()
-    prize = m.text.strip()
-    if not prize or len(prize) > 80:
-        return await m.answer("Опишите приз коротко, до 80 символов.")
-    title, text = templates.render(d["tpl"], prize)
-    await state.update_data(title=title[:100], text_fmt=logic.autoformat(text), text_raw=None)
-    await show_text_preview(m, state)
+    nav = d.get("nav", [])
+    if not nav or nav[-1] != step:
+        nav.append(step)
+    await state.update_data(nav=nav)
+    await state.set_state(st)
 
 
-@admin_router.message(Create.text, F.text)
-async def c_text(m: Message, state: FSMContext):
-    if len(m.text) > 2500:
-        return await m.answer("Слишком длинный текст (максимум 2500 символов). Сократите.")
-    raw = m.html_text
-    fmt = logic.autoformat(raw)
-    await state.update_data(text_raw=raw, text_fmt=fmt)
-    if fmt == raw:
-        await state.update_data(text=raw)
-        return await ask_photos(m, state)
-    await show_text_preview(m, state)
+async def ask_template(message: Message, state: FSMContext, uid: int):
+    await enter(state, "template", Create.template)
+    rows = [[btn(t["name"], f"tp:{key}")] for key, t in templates.TEMPLATES.items()]
+    rows.append([btn("✍️ Свой текст", "tp:custom")])
+    rows.append(HOME)
+    await message.answer(
+        "🧩 Выберите шаблон розыгрыша: бот сам оформит текст, вам останется назвать приз. "
+        "Или напишите свой текст, бот его отформатирует.",
+        reply_markup=kb(rows))
 
 
-async def show_text_preview(message: Message, state: FSMContext):
+async def ask_title(message: Message, state: FSMContext, uid: int):
+    await enter(state, "title", Create.title)
+    await message.answer("📝 Название розыгрыша (для вашего списка и заголовка поста):",
+                         reply_markup=kb([NAV]))
+
+
+async def ask_prize(message: Message, state: FSMContext, uid: int):
     d = await state.get_data()
-    await state.set_state(Create.text_preview)
+    await enter(state, "prize", Create.prize)
+    await message.answer(templates.TEMPLATES[d["tpl"]]["ask"], reply_markup=kb([NAV]))
+
+
+async def ask_text(message: Message, state: FSMContext, uid: int):
+    await enter(state, "text", Create.text)
+    await message.answer(
+        "✍️ Текст розыгрыша: что разыгрываем и условия. Форматирование сохранится, "
+        "бот сам приведёт текст в порядок.", reply_markup=kb([NAV]))
+
+
+async def show_text_preview(message: Message, state: FSMContext, uid: int):
+    d = await state.get_data()
+    await enter(state, "text_preview", Create.text_preview)
     if d.get("text_raw"):
         head = "✨ Я отформатировал ваш текст. Так он будет выглядеть:"
         rows = [[btn("✨ Использовать", "tf:fmt")], [btn("📝 Оставить как написал", "tf:raw")]]
     else:
         head = "👀 Так будет выглядеть текст розыгрыша:"
         rows = [[btn("✅ Использовать", "tf:fmt")], [btn("✏️ Написать свой текст", "tf:edit")]]
-    rows.append(CANCEL)
+    rows.append(NAV)
     await message.answer(f"{head}\n\n{d['text_fmt']}", reply_markup=kb(rows))
 
 
-@admin_router.callback_query(Create.text_preview, F.data.startswith("tf:"))
-async def c_text_choice(cb: CallbackQuery, state: FSMContext):
-    choice = cb.data.split(":", 1)[1]
+async def ask_photos(message: Message, state: FSMContext, uid: int):
     d = await state.get_data()
-    await cb.answer()
-    if choice == "edit":
-        await state.set_state(Create.text)
-        return await cb.message.answer(
-            "✍️ Пришлите свой текст. Бот сам его отформатирует.", reply_markup=kb([CANCEL]))
-    text = d["text_fmt"] if choice == "fmt" or not d.get("text_raw") else d["text_raw"]
-    await state.update_data(text=text)
-    await ask_photos(cb.message, state)
-
-
-async def ask_photos(message: Message, state: FSMContext):
-    await state.update_data(photos=[])
-    await state.set_state(Create.photos)
+    n = len(d.get("photos", []))
+    await enter(state, "photos", Create.photos)
+    note = f" Сейчас фото: {n}/3." if n else ""
     await message.answer(
-        "📷 Пришлите до 3 фото приза или нажмите «Далее», чтобы пропустить.",
-        reply_markup=kb([[btn("➡️ Далее", "ph:next")], CANCEL]))
+        "📷 Пришлите до 3 фото приза или нажмите «Далее», чтобы пропустить." + note,
+        reply_markup=kb([[btn("➡️ Далее", "ph:next")], NAV]))
 
 
-@admin_router.message(Create.photos, F.photo)
-async def c_photo(m: Message, state: FSMContext):
+async def ask_price(message: Message, state: FSMContext, uid: int):
     d = await state.get_data()
-    photos = d.get("photos", [])
-    if len(photos) >= 3:
-        return await m.answer("Максимум 3 фото. Нажмите «Далее».",
-                              reply_markup=kb([[btn("➡️ Далее", "ph:next")], CANCEL]))
-    photos.append(m.photo[-1].file_id)
-    await state.update_data(photos=photos)
-    await m.answer(f"📷 Фото добавлено ({len(photos)}/3).",
-                   reply_markup=kb([[btn("➡️ Далее", "ph:next")], CANCEL]))
+    hint = templates.TEMPLATES.get(d.get("tpl") or "", {}).get(
+        "price_hint", "Введите 0, если участие бесплатное.")
+    await enter(state, "price", Create.price)
+    await message.answer(
+        f"💰 Стоимость одного билета в рублях (целое число). {hint}", reply_markup=kb([NAV]))
 
 
-@admin_router.callback_query(Create.photos, F.data == "ph:next")
-async def c_photos_next(cb: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    hint = templates.TEMPLATES.get(d.get("tpl") or "", {}).get("price_hint", "Введите 0, если участие бесплатное.")
-    await state.set_state(Create.price)
-    await cb.message.answer(
-        f"💰 Стоимость одного билета в рублях (целое число). {hint}",
-        reply_markup=kb([CANCEL]))
-    await cb.answer()
+async def ask_pay_mode(message: Message, state: FSMContext, uid: int):
+    await enter(state, "pay_mode", Create.pay_mode)
+    await message.answer(
+        "💳 Как участники будут платить?\n\n"
+        "💳 ЮKassa — оплата картой прямо в Telegram, билеты выдаются автоматически.\n"
+        "🧾 Реквизиты — перевод и чек, вы подтверждаете каждую заявку вручную.\n"
+        "🔀 Оба — участник выберет сам.",
+        reply_markup=kb([
+            [btn("💳 ЮKassa", "pmode:y")],
+            [btn("🧾 Реквизиты и чек", "pmode:m")],
+            [btn("🔀 Оба способа", "pmode:b")],
+            NAV,
+        ]))
 
 
-@admin_router.message(Create.price, F.text)
-async def c_price(m: Message, state: FSMContext):
-    if not m.text.strip().isdigit():
-        return await m.answer("Введите целое число, например 100 (или 0 для бесплатного).")
-    await state.update_data(price=int(m.text.strip()))
-    await state.set_state(Create.btn)
+async def ask_btn(message: Message, state: FSMContext, uid: int):
+    await enter(state, "btn", Create.btn)
     rows = [[btn(t, f"bt:{i}")] for i, t in enumerate(BTN_OPTIONS)]
     rows.append([btn("✏️ Свой текст кнопки", "bt:c")])
-    rows.append(CANCEL)
-    await m.answer("🔘 Текст кнопки под постом:", reply_markup=kb(rows))
+    rows.append(NAV)
+    await message.answer("🔘 Текст кнопки под постом:", reply_markup=kb(rows))
 
 
-@admin_router.callback_query(Create.btn, F.data.startswith("bt:"))
-async def c_btn(cb: CallbackQuery, state: FSMContext):
-    choice = cb.data.split(":")[1]
-    await cb.answer()
-    if choice == "c":
-        await state.set_state(Create.btn_custom)
-        return await cb.message.answer("Пришлите свой текст кнопки (до 40 символов):",
-                                       reply_markup=kb([CANCEL]))
-    await state.update_data(btn_text=BTN_OPTIONS[int(choice)])
-    await ask_winners(cb.message, state)
+async def ask_btn_custom(message: Message, state: FSMContext, uid: int):
+    await enter(state, "btn_custom", Create.btn_custom)
+    await message.answer("Пришлите свой текст кнопки (до 40 символов):", reply_markup=kb([NAV]))
 
 
-@admin_router.message(Create.btn_custom, F.text)
-async def c_btn_custom(m: Message, state: FSMContext):
-    if len(m.text) > 40:
-        return await m.answer("Слишком длинно, максимум 40 символов.")
-    await state.update_data(btn_text=m.text.strip())
-    await ask_winners(m, state)
-
-
-async def ask_winners(message: Message, state: FSMContext):
-    await state.set_state(Create.winners)
-    await message.answer("🏆 Сколько будет победителей? (от 1 до 100)", reply_markup=kb([CANCEL]))
-
-
-@admin_router.message(Create.winners, F.text)
-async def c_winners(m: Message, state: FSMContext):
-    t = m.text.strip()
-    if not t.isdigit() or not 1 <= int(t) <= 100:
-        return await m.answer("Введите число от 1 до 100.")
-    await state.update_data(winners=int(t))
-    await ask_channel(m, state, m.from_user.id)
+async def ask_winners(message: Message, state: FSMContext, uid: int):
+    await enter(state, "winners", Create.winners)
+    await message.answer("🏆 Сколько будет победителей? (от 1 до 100)", reply_markup=kb([NAV]))
 
 
 async def ask_channel(message: Message, state: FSMContext, uid: int):
     chans = db.list_channels(uid)
     if not chans:
         await state.clear()
-        return await message.answer("У вас нет подключённых каналов.", reply_markup=ADMIN_KB)
+        return await message.answer("У вас нет подключённых каналов.", reply_markup=kb([HOME]))
+    await enter(state, "channel", Create.channel)
     rows = [[btn(f"📢 {c['title']}", f"pc:{c['chat_id']}")] for c in chans]
-    rows.append(CANCEL)
-    await state.set_state(Create.channel)
+    rows.append(NAV)
     await message.answer("📢 В каком канале опубликовать розыгрыш?", reply_markup=kb(rows))
-
-
-@admin_router.callback_query(Create.channel, F.data.startswith("pc:"))
-async def c_channel(cb: CallbackQuery, state: FSMContext):
-    chat_id = int(cb.data.split(":", 1)[1])
-    if chat_id not in {c["chat_id"] for c in db.list_channels(cb.from_user.id)}:
-        return await cb.answer("Канал не найден", show_alert=True)
-    await state.update_data(post_chat=chat_id, extra=[])
-    await cb.answer()
-    await ask_extras(cb.message, state, cb.from_user.id)
 
 
 async def extras_markup(uid: int, post_chat: int, selected: list):
@@ -919,18 +1118,272 @@ async def extras_markup(uid: int, post_chat: int, selected: list):
         rows.append([btn(f"{mark} {c['title']}", f"ex:{c['chat_id']}")])
     rows.append([btn("➕ Добавить по @username", "exadd")])
     rows.append([btn("➡️ Далее", "exdone")])
-    rows.append(CANCEL)
+    rows.append(NAV)
     return kb(rows)
 
 
 async def ask_extras(message: Message, state: FSMContext, uid: int):
     d = await state.get_data()
-    await state.set_state(Create.extra)
+    await enter(state, "extra", Create.extra)
     await message.answer(
         "🔗 Дополнительные каналы для обязательной подписки (необязательно).\n"
         "Подписка на канал розыгрыша проверяется всегда. Отметьте остальные каналы, "
         "где бот администратор, или добавьте по @username:",
         reply_markup=await extras_markup(uid, d["post_chat"], d.get("extra", [])))
+
+
+async def ask_extra_add(message: Message, state: FSMContext, uid: int):
+    await enter(state, "extra_add", Create.extra_add)
+    await message.answer("Пришлите @username канала (бот должен быть в нём администратором):",
+                         reply_markup=kb([NAV]))
+
+
+async def ask_start_mode(message: Message, state: FSMContext, uid: int):
+    await enter(state, "start_mode", Create.start_mode)
+    await message.answer(
+        "🚀 Когда опубликовать розыгрыш?",
+        reply_markup=kb([[btn("⚡ Сразу", "st:now"), btn("🕐 Указать время", "st:time")], NAV]))
+
+
+async def ask_start_at(message: Message, state: FSMContext, uid: int):
+    await enter(state, "start_at", Create.start_at)
+    await message.answer("Время публикации по Москве, формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+                         reply_markup=kb([NAV]))
+
+
+async def ask_end_mode(message: Message, state: FSMContext, uid: int):
+    await enter(state, "end_mode", Create.end_mode)
+    await message.answer(
+        "🏁 Как завершить розыгрыш?",
+        reply_markup=kb([[btn("⏰ По времени", "en:time"),
+                          btn("👥 По числу участников", "en:count")], NAV]))
+
+
+async def ask_end_at(message: Message, state: FSMContext, uid: int):
+    await enter(state, "end_at", Create.end_at)
+    await message.answer("Время завершения по Москве, формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+                         reply_markup=kb([NAV]))
+
+
+async def ask_end_count(message: Message, state: FSMContext, uid: int):
+    await enter(state, "end_count", Create.end_count)
+    await message.answer("Сколько участников нужно набрать для завершения?", reply_markup=kb([NAV]))
+
+
+async def ask_draw_mode(message: Message, state: FSMContext, uid: int):
+    await enter(state, "draw_mode", Create.draw_mode)
+    await message.answer(
+        "🎯 Как выбрать победителей после завершения?\n\n"
+        "🎲 Автоматически — бот сам выберет случайно и объявит итоги.\n"
+        "✍️ Вручную — бот закроет приём участников и ждёт, пока вы укажете номера билетов "
+        "(рандом тоже будет доступен кнопкой).",
+        reply_markup=kb([[btn("🎲 Автоматически", "dm:random"), btn("✍️ Вручную", "dm:manual")], NAV]))
+
+
+def options_markup(d: dict):
+    return kb([
+        [btn(f"🚀 Буст канала = +1 шанс: {'ВКЛ' if d.get('boost') else 'ВЫКЛ'}", "opt:boost")],
+        [btn(f"🤖 Капча от накрутки: {'ВКЛ' if d.get('captcha') else 'ВЫКЛ'}", "opt:captcha")],
+        [btn("➡️ Далее", "opt:done")],
+        NAV,
+    ])
+
+
+async def ask_options(message: Message, state: FSMContext, uid: int):
+    d = await state.get_data()
+    await enter(state, "options", Create.options)
+    await message.answer(
+        "⚙️ Дополнительно:\n"
+        "• Буст — участники, забустившие канал розыгрыша, получают дополнительный слот "
+        "(проверяется при подведении итогов).\n"
+        "• Капча — простая проверка от ботов перед участием.",
+        reply_markup=options_markup(d))
+
+
+async def ask_fix_text(message: Message, state: FSMContext, uid: int):
+    await enter(state, "fix_text", Create.fix_text)
+    await message.answer("✍️ Пришлите новый, более короткий текст. Бот сам его отформатирует.",
+                         reply_markup=kb([NAV]))
+
+
+async def go_confirm(message: Message, state: FSMContext, uid: int):
+    """Предпросмотр. Если фото есть, а текст не помещается в подпись — предлагаем исправить."""
+    d = await state.get_data()
+    g = draft_giveaway(d)
+    if g["photos"] and not caption_fits(g):
+        await state.set_state(Create.options)
+        return await message.answer(
+            f"⚠️ Текст вместе с условиями занимает {caption_size(g)} символов, а подпись к фото "
+            f"в Telegram — не больше {CAPTION_LIMIT} (с запасом). Чтобы фото и текст вышли одним "
+            "сообщением, сократите текст или уберите фото.",
+            reply_markup=kb([[btn("✏️ Изменить текст", "fx:text")],
+                             [btn("🗑 Убрать фото", "fx:photos")], NAV]))
+    await enter(state, "confirm", Create.confirm)
+    await message.answer(summary(d, uid),
+                         reply_markup=kb([[btn("✅ Сохранить", "cf:save")], NAV]))
+
+
+# шаг -> функция, которая показывает его заново (для кнопки «Назад»)
+ASK = {
+    "template": ask_template, "title": ask_title, "prize": ask_prize, "text": ask_text,
+    "text_preview": show_text_preview, "photos": ask_photos, "price": ask_price,
+    "pay_mode": ask_pay_mode, "btn": ask_btn,
+    "btn_custom": ask_btn_custom, "winners": ask_winners, "channel": ask_channel,
+    "extra": ask_extras, "extra_add": ask_extra_add, "start_mode": ask_start_mode,
+    "start_at": ask_start_at, "end_mode": ask_end_mode, "end_at": ask_end_at,
+    "end_count": ask_end_count, "draw_mode": ask_draw_mode, "options": ask_options,
+    "fix_text": ask_fix_text, "confirm": go_confirm,
+}
+
+
+@admin_router.callback_query(StateFilter(Create), F.data == "back")
+async def create_back(cb: CallbackQuery, state: FSMContext):
+    """Шаг назад: возвращаемся к предыдущему шагу сценария создания."""
+    d = await state.get_data()
+    nav = d.get("nav", [])
+    await cb.answer()
+    if nav:
+        nav.pop()  # текущий шаг
+    if not nav:
+        await state.clear()
+        return await show_main_menu(cb.message)
+    prev = nav.pop()  # предыдущий; ask-функция сама вернёт его в стек
+    await state.update_data(nav=nav)
+    await ASK[prev](cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.title, F.text)
+async def c_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text.strip()[:100])
+    await ask_text(m, state, m.from_user.id)
+
+
+@admin_router.callback_query(Create.template, F.data.startswith("tp:"))
+async def c_template(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":", 1)[1]
+    await cb.answer()
+    if key == "custom":
+        await state.update_data(tpl=None)
+        return await ask_title(cb.message, state, cb.from_user.id)
+    if key not in templates.TEMPLATES:
+        return
+    await state.update_data(tpl=key)
+    await ask_prize(cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.prize, F.text)
+async def c_prize(m: Message, state: FSMContext):
+    d = await state.get_data()
+    prize = m.text.strip()
+    if not prize or len(prize) > 80:
+        return await m.answer("Опишите приз коротко, до 80 символов.", reply_markup=kb([NAV]))
+    title, text = templates.render(d["tpl"], prize)
+    await state.update_data(title=title[:100], text_fmt=logic.autoformat(text), text_raw=None)
+    await show_text_preview(m, state, m.from_user.id)
+
+
+@admin_router.message(Create.text, F.text)
+async def c_text(m: Message, state: FSMContext):
+    if len(m.text) > 2500:
+        return await m.answer("Слишком длинный текст (максимум 2500 символов). Сократите.",
+                              reply_markup=kb([NAV]))
+    raw = m.html_text
+    fmt = logic.autoformat(raw)
+    await state.update_data(text_raw=raw, text_fmt=fmt)
+    if fmt == raw:
+        await state.update_data(text=raw, photos=[])
+        return await ask_photos(m, state, m.from_user.id)
+    await show_text_preview(m, state, m.from_user.id)
+
+
+@admin_router.callback_query(Create.text_preview, F.data.startswith("tf:"))
+async def c_text_choice(cb: CallbackQuery, state: FSMContext):
+    choice = cb.data.split(":", 1)[1]
+    d = await state.get_data()
+    await cb.answer()
+    if choice == "edit":
+        return await ask_text(cb.message, state, cb.from_user.id)
+    text = d["text_fmt"] if choice == "fmt" or not d.get("text_raw") else d["text_raw"]
+    await state.update_data(text=text, photos=[])
+    await ask_photos(cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.photos, F.photo)
+async def c_photo(m: Message, state: FSMContext):
+    d = await state.get_data()
+    photos = d.get("photos", [])
+    if len(photos) >= 3:
+        return await m.answer("Максимум 3 фото. Нажмите «Далее».",
+                              reply_markup=kb([[btn("➡️ Далее", "ph:next")], NAV]))
+    photos.append(m.photo[-1].file_id)
+    await state.update_data(photos=photos)
+    await m.answer(f"📷 Фото добавлено ({len(photos)}/3).",
+                   reply_markup=kb([[btn("➡️ Далее", "ph:next")], NAV]))
+
+
+@admin_router.callback_query(Create.photos, F.data == "ph:next")
+async def c_photos_next(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await ask_price(cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.price, F.text)
+async def c_price(m: Message, state: FSMContext):
+    if not m.text.strip().isdigit():
+        return await m.answer("Введите целое число, например 100 (или 0 для бесплатного).",
+                              reply_markup=kb([NAV]))
+    price = int(m.text.strip())
+    await state.update_data(price=price, pay_mode="manual")
+    if price > 0 and YOOKASSA_PROVIDER_TOKEN:
+        return await ask_pay_mode(m, state, m.from_user.id)
+    await ask_btn(m, state, m.from_user.id)
+
+
+@admin_router.callback_query(Create.pay_mode, F.data.startswith("pmode:"))
+async def c_pay_mode(cb: CallbackQuery, state: FSMContext):
+    mode = {"y": "yookassa", "m": "manual", "b": "both"}.get(cb.data.split(":")[1])
+    if not mode:
+        return await cb.answer()
+    await state.update_data(pay_mode=mode)
+    await cb.answer()
+    await ask_btn(cb.message, state, cb.from_user.id)
+
+
+@admin_router.callback_query(Create.btn, F.data.startswith("bt:"))
+async def c_btn(cb: CallbackQuery, state: FSMContext):
+    choice = cb.data.split(":")[1]
+    await cb.answer()
+    if choice == "c":
+        return await ask_btn_custom(cb.message, state, cb.from_user.id)
+    await state.update_data(btn_text=BTN_OPTIONS[int(choice)])
+    await ask_winners(cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.btn_custom, F.text)
+async def c_btn_custom(m: Message, state: FSMContext):
+    if len(m.text) > 40:
+        return await m.answer("Слишком длинно, максимум 40 символов.", reply_markup=kb([NAV]))
+    await state.update_data(btn_text=m.text.strip())
+    await ask_winners(m, state, m.from_user.id)
+
+
+@admin_router.message(Create.winners, F.text)
+async def c_winners(m: Message, state: FSMContext):
+    t = m.text.strip()
+    if not t.isdigit() or not 1 <= int(t) <= 100:
+        return await m.answer("Введите число от 1 до 100.", reply_markup=kb([NAV]))
+    await state.update_data(winners=int(t))
+    await ask_channel(m, state, m.from_user.id)
+
+
+@admin_router.callback_query(Create.channel, F.data.startswith("pc:"))
+async def c_channel(cb: CallbackQuery, state: FSMContext):
+    chat_id = int(cb.data.split(":", 1)[1])
+    if chat_id not in {c["chat_id"] for c in db.list_channels(cb.from_user.id)}:
+        return await cb.answer("Канал не найден", show_alert=True)
+    await state.update_data(post_chat=chat_id, extra=[])
+    await cb.answer()
+    await ask_extras(cb.message, state, cb.from_user.id)
 
 
 @admin_router.callback_query(Create.extra, F.data.startswith("ex:"))
@@ -950,17 +1403,15 @@ async def c_extra_toggle(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(Create.extra, F.data == "exadd")
 async def c_extra_add_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Create.extra_add)
-    await cb.message.answer("Пришлите @username канала (бот должен быть в нём администратором):",
-                            reply_markup=kb([CANCEL]))
     await cb.answer()
+    await ask_extra_add(cb.message, state, cb.from_user.id)
 
 
 @admin_router.message(Create.extra_add, F.text)
 async def c_extra_add(m: Message, state: FSMContext, bot: Bot):
     chat, error = await register_channel(bot, m.text, m.from_user.id)
     if error:
-        return await m.answer(error)
+        return await m.answer(error, reply_markup=kb([NAV]))
     d = await state.get_data()
     extra = d.get("extra", [])
     if chat.id != d["post_chat"] and chat.id not in extra:
@@ -971,11 +1422,8 @@ async def c_extra_add(m: Message, state: FSMContext, bot: Bot):
 
 @admin_router.callback_query(Create.extra, F.data == "exdone")
 async def c_extra_done(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Create.start_mode)
-    await cb.message.answer(
-        "🚀 Когда опубликовать розыгрыш?",
-        reply_markup=kb([[btn("⚡ Сразу", "st:now"), btn("🕐 Указать время", "st:time")], CANCEL]))
     await cb.answer()
+    await ask_start_mode(cb.message, state, cb.from_user.id)
 
 
 @admin_router.callback_query(Create.start_mode, F.data.startswith("st:"))
@@ -983,29 +1431,21 @@ async def c_start_mode(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     if cb.data == "st:now":
         await state.update_data(start_at=int(time.time()))
-        return await ask_end_mode(cb.message, state)
-    await state.set_state(Create.start_at)
-    await cb.message.answer("Время публикации по Москве, формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
-                            reply_markup=kb([CANCEL]))
+        return await ask_end_mode(cb.message, state, cb.from_user.id)
+    await ask_start_at(cb.message, state, cb.from_user.id)
 
 
 @admin_router.message(Create.start_at, F.text)
 async def c_start_at(m: Message, state: FSMContext):
     ts = logic.parse_msk(m.text)
     if ts is None:
-        return await m.answer("Не понял формат. Пример: <code>25.12.2026 18:30</code>")
+        return await m.answer("Не понял формат. Пример: <code>25.12.2026 18:30</code>",
+                              reply_markup=kb([NAV]))
     if ts <= time.time():
-        return await m.answer("Это время уже прошло. Укажите время в будущем.")
+        return await m.answer("Это время уже прошло. Укажите время в будущем.",
+                              reply_markup=kb([NAV]))
     await state.update_data(start_at=ts)
-    await ask_end_mode(m, state)
-
-
-async def ask_end_mode(message: Message, state: FSMContext):
-    await state.set_state(Create.end_mode)
-    await message.answer(
-        "🏁 Как завершить розыгрыш?",
-        reply_markup=kb([[btn("⏰ По времени", "en:time"),
-                          btn("👥 По числу участников", "en:count")], CANCEL]))
+    await ask_end_mode(m, state, m.from_user.id)
 
 
 @admin_router.callback_query(Create.end_mode, F.data.startswith("en:"))
@@ -1013,14 +1453,9 @@ async def c_end_mode(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     if cb.data == "en:time":
         await state.update_data(end_mode="time")
-        await state.set_state(Create.end_at)
-        return await cb.message.answer(
-            "Время завершения по Москве, формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
-            reply_markup=kb([CANCEL]))
+        return await ask_end_at(cb.message, state, cb.from_user.id)
     await state.update_data(end_mode="count")
-    await state.set_state(Create.end_count)
-    await cb.message.answer("Сколько участников нужно набрать для завершения?",
-                            reply_markup=kb([CANCEL]))
+    await ask_end_count(cb.message, state, cb.from_user.id)
 
 
 @admin_router.message(Create.end_at, F.text)
@@ -1028,30 +1463,22 @@ async def c_end_at(m: Message, state: FSMContext):
     ts = logic.parse_msk(m.text)
     d = await state.get_data()
     if ts is None:
-        return await m.answer("Не понял формат. Пример: <code>31.12.2026 20:00</code>")
+        return await m.answer("Не понял формат. Пример: <code>31.12.2026 20:00</code>",
+                              reply_markup=kb([NAV]))
     if ts <= max(time.time(), d["start_at"]):
-        return await m.answer("Время завершения должно быть позже публикации и в будущем.")
+        return await m.answer("Время завершения должно быть позже публикации и в будущем.",
+                              reply_markup=kb([NAV]))
     await state.update_data(end_at=ts)
-    await ask_draw_mode(m, state)
+    await ask_draw_mode(m, state, m.from_user.id)
 
 
 @admin_router.message(Create.end_count, F.text)
 async def c_end_count(m: Message, state: FSMContext):
     t = m.text.strip()
     if not t.isdigit() or int(t) < 1:
-        return await m.answer("Введите целое число больше нуля.")
+        return await m.answer("Введите целое число больше нуля.", reply_markup=kb([NAV]))
     await state.update_data(end_count=int(t))
-    await ask_draw_mode(m, state)
-
-
-async def ask_draw_mode(message: Message, state: FSMContext):
-    await state.set_state(Create.draw_mode)
-    await message.answer(
-        "🎯 Как выбрать победителей после завершения?\n\n"
-        "🎲 Автоматически — бот сам выберет случайно и объявит итоги.\n"
-        "✍️ Вручную — бот закроет приём участников и ждёт, пока вы укажете номера билетов "
-        "(рандом тоже будет доступен кнопкой).",
-        reply_markup=kb([[btn("🎲 Автоматически", "dm:random"), btn("✍️ Вручную", "dm:manual")], CANCEL]))
+    await ask_draw_mode(m, state, m.from_user.id)
 
 
 @admin_router.callback_query(Create.draw_mode, F.data.startswith("dm:"))
@@ -1060,27 +1487,7 @@ async def c_draw_mode(cb: CallbackQuery, state: FSMContext):
     await state.update_data(draw_mode=cb.data.split(":")[1],
                             boost=0, captcha=1 if d["price"] == 0 else 0)
     await cb.answer()
-    await ask_options(cb.message, state)
-
-
-def options_markup(d: dict):
-    return kb([
-        [btn(f"🚀 Буст канала = +1 шанс: {'ВКЛ' if d.get('boost') else 'ВЫКЛ'}", "opt:boost")],
-        [btn(f"🤖 Капча от накрутки: {'ВКЛ' if d.get('captcha') else 'ВЫКЛ'}", "opt:captcha")],
-        [btn("➡️ Далее", "opt:done")],
-        CANCEL,
-    ])
-
-
-async def ask_options(message: Message, state: FSMContext):
-    d = await state.get_data()
-    await state.set_state(Create.options)
-    await message.answer(
-        "⚙️ Дополнительно:\n"
-        "• Буст — участники, забустившие канал розыгрыша, получают дополнительный слот "
-        "(проверяется при подведении итогов).\n"
-        "• Капча — простая проверка от ботов перед участием.",
-        reply_markup=options_markup(d))
+    await ask_options(cb.message, state, cb.from_user.id)
 
 
 @admin_router.callback_query(Create.options, F.data.in_({"opt:boost", "opt:captcha"}))
@@ -1111,19 +1518,39 @@ def summary(d: dict, uid: int) -> str:
                                    else f"при {d['end_count']} участниках"))
     lines.append("Победители: " + ("рандом автоматически" if d["draw_mode"] == "random" else "выбираю вручную"))
     lines.append(f"Буст: {'да' if d.get('boost') else 'нет'}, капча: {'да' if d.get('captcha') else 'нет'}")
-    if d["price"] > 0 and not db.get_setting(f"payment:{uid}"):
-        lines.append("\n⚠️ Реквизиты не заданы. Добавьте их в «💳 Реквизиты», иначе оплата будет недоступна.")
+    if d["price"] > 0:
+        mode = d.get("pay_mode", "manual")
+        lines.append(f"Оплата: {PAY_MODE_NAME[mode]}")
+        if mode in ("manual", "both") and not db.get_setting(f"payment:{uid}"):
+            lines.append("\n⚠️ Реквизиты не заданы. Добавьте их в «💳 Реквизиты», иначе оплата по реквизитам будет недоступна.")
     return "\n".join(lines)
 
 
 @admin_router.callback_query(Create.options, F.data == "opt:done")
 async def c_options_done(cb: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    await state.set_state(Create.confirm)
-    await cb.message.answer(
-        summary(d, cb.from_user.id),
-        reply_markup=kb([[btn("✅ Сохранить", "cf:save")], CANCEL]))
     await cb.answer()
+    await go_confirm(cb.message, state, cb.from_user.id)
+
+
+@admin_router.callback_query(Create.options, F.data == "fx:text")
+async def c_fix_text_start(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await ask_fix_text(cb.message, state, cb.from_user.id)
+
+
+@admin_router.callback_query(Create.options, F.data == "fx:photos")
+async def c_fix_drop_photos(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(photos=[])
+    await cb.answer("Фото убраны")
+    await go_confirm(cb.message, state, cb.from_user.id)
+
+
+@admin_router.message(Create.fix_text, F.text)
+async def c_fix_text(m: Message, state: FSMContext):
+    if len(m.text) > 2500:
+        return await m.answer("Слишком длинный текст. Сократите.", reply_markup=kb([NAV]))
+    await state.update_data(text=logic.autoformat(m.html_text))
+    await go_confirm(m, state, m.from_user.id)
 
 
 @admin_router.callback_query(Create.confirm, F.data == "cf:save")
@@ -1137,6 +1564,7 @@ async def c_save(cb: CallbackQuery, state: FSMContext, bot: Bot):
         end_mode=d["end_mode"], end_at=d.get("end_at"), end_count=d.get("end_count"),
         draw_mode=d["draw_mode"], boost=int(d.get("boost", 0)),
         captcha=int(d.get("captcha", 0)), status="scheduled",
+        pay_mode=d.get("pay_mode", "manual"),
     )
     await state.clear()
     await cb.answer("Сохранено")
@@ -1159,7 +1587,8 @@ def giveaway_card(g: dict) -> str:
         f"{STATUS_ICON.get(g['status'], '•')} <b>#{gid} {esc(g['title'])}</b>",
         f"Статус: {STATUS_NAME.get(g['status'], g['status'])}",
         f"Канал: {esc(channel_title(g['post_chat_id']))}",
-        f"Билет: {str(g['price']) + ' ₽' if g['price'] else 'бесплатно'}",
+        f"Билет: {str(g['price']) + ' ₽' if g['price'] else 'бесплатно'}"
+        + (f" ({PAY_MODE_NAME.get(g.get('pay_mode'), '')})" if g["price"] else ""),
         f"Победителей: {g['winners_count']} ({'рандом' if g['draw_mode'] == 'random' else 'вручную'})",
         "Публикация: " + logic.fmt_msk(g["start_at"]),
         "Завершение: " + (logic.fmt_msk(g["end_at"]) if g["end_mode"] == "time"
@@ -1189,7 +1618,8 @@ def giveaway_buttons(g: dict):
         rows.append([btn("👥 Участники (CSV)", f"gvp:{gid}")])
     if st in ("scheduled", "active"):
         rows.append([btn("⛔ Отменить розыгрыш", f"gvx:{gid}")])
-    return kb(rows) if rows else None
+    rows.append(back_to("gl"))
+    return kb(rows)
 
 
 def own_giveaway(cb: CallbackQuery):
@@ -1201,7 +1631,8 @@ def own_giveaway(cb: CallbackQuery):
 
 
 @admin_router.callback_query(F.data.startswith("gv:"))
-async def giveaway_open(cb: CallbackQuery):
+async def giveaway_open(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     g = own_giveaway(cb)
     if not g:
         return await cb.answer("Розыгрыш не найден", show_alert=True)
@@ -1236,7 +1667,7 @@ async def giveaway_finish_menu(cb: CallbackQuery):
         return await cb.answer("Недоступно", show_alert=True)
     await cb.message.answer(
         f"Завершить «{esc(g['title'])}» сейчас? Приём участников закроется. Выберите способ:",
-        reply_markup=draw_buttons(g["id"]))
+        reply_markup=draw_buttons(g["id"], back=f"gv:{g['id']}"))
     await cb.answer()
 
 
@@ -1247,7 +1678,8 @@ async def giveaway_random(cb: CallbackQuery, bot: Bot):
         return await cb.answer("Розыгрыш не найден", show_alert=True)
     await cb.answer("Выбираю…")
     if not await do_random_draw(bot, g["id"]):
-        return await cb.message.answer("Розыгрыш уже завершён или обрабатывается.")
+        return await cb.message.answer("Розыгрыш уже завершён или обрабатывается.",
+                                       reply_markup=kb([back_to("gl")]))
 
 
 @admin_router.callback_query(F.data.startswith("gvm:"))
@@ -1259,7 +1691,8 @@ async def giveaway_manual_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(gid=g["id"])
     await cb.message.answer(
         f"✍️ Введите номера билетов победителей (до {g['winners_count']}) "
-        "через пробел или запятую. Список билетов — кнопка «👥 Участники». Для отмены: /cancel")
+        "через пробел или запятую. Список билетов — кнопка «👥 Участники».",
+        reply_markup=kb([back_to(f"gv:{g['id']}")]))
     await cb.answer()
 
 
@@ -1302,7 +1735,7 @@ async def giveaway_cancel(cb: CallbackQuery, bot: Bot):
     if not db.set_status_if(g["id"], ("scheduled", "active"), "cancelled"):
         return await cb.answer("Нельзя отменить в текущем статусе", show_alert=True)
     await remove_post_button(bot, g)
-    await cb.message.answer(f"⛔ Розыгрыш #{g['id']} отменён.")
+    await cb.message.answer(f"⛔ Розыгрыш #{g['id']} отменён.", reply_markup=kb([back_to("gl")]))
     await cb.answer()
 
 

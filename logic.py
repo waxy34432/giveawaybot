@@ -1,4 +1,5 @@
 """Чистая логика без зависимостей от Telegram: время, розыгрыш, разбор номеров."""
+import html
 import random
 import re
 from datetime import datetime, timedelta, timezone
@@ -81,3 +82,33 @@ def autoformat(text: str) -> str:
     while out and out[-1] == "":
         out.pop()
     return "\n".join(out)
+
+
+def visible_len(html_text: str) -> int:
+    """Длина текста так, как её считает Telegram: без HTML-тегов, с раскрытыми &amp; и т. п."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+
+
+def build_receipt(description: str, qty: int, unit_price: int, vat_code: int = 1, tax_system=None) -> dict:
+    """Данные чека для provider_data ЮKassa: одна позиция «билеты» (цена за штуку × количество)."""
+    receipt = {
+        "items": [{
+            "description": description[:128],
+            "quantity": f"{qty}.00",
+            "amount": {"value": f"{unit_price}.00", "currency": "RUB"},
+            "vat_code": vat_code,
+            "payment_mode": "full_payment",
+            "payment_subject": "service",
+        }]
+    }
+    if tax_system:
+        receipt["tax_system_code"] = tax_system
+    return {"receipt": receipt}
+
+
+def parse_invoice_payload(payload: str):
+    """'gv:12:3' -> (12, 3) или None."""
+    parts = (payload or "").split(":")
+    if len(parts) == 3 and parts[0] == "gv" and parts[1].isdigit() and parts[2].isdigit():
+        return int(parts[1]), int(parts[2])
+    return None

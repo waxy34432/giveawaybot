@@ -15,12 +15,14 @@ from contextvars import ContextVar
 
 from aiogram import BaseMiddleware
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
-from aiogram.methods import SendDocument, SendMediaGroup, SendMessage, SendPhoto, SendVideo
+from aiogram.methods import (
+    SendDocument, SendInvoice, SendMediaGroup, SendMessage, SendPhoto, SendVideo,
+)
 
 log = logging.getLogger("cleanchat")
 
 _MODE: ContextVar = ContextVar("send_mode", default="dialog")
-_TRACKED = (SendMessage, SendPhoto, SendDocument, SendVideo, SendMediaGroup)
+_TRACKED = (SendMessage, SendPhoto, SendDocument, SendVideo, SendMediaGroup, SendInvoice)
 
 
 @contextmanager
